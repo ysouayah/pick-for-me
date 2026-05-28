@@ -46,13 +46,24 @@ def fetch_amazon_products(search_term):
         response.raise_for_status()
         data = response.json()
         
-        # Bumped to 15 to give the pre-filter a larger pool of options
         top_results = data.get("search_results", [])[:15]
         
         dynamic_products = []
+        seen_names = {} # <-- NEW: Dictionary to track duplicate names
+        
         for item in top_results:
+            base_name = item.get("title", "Unknown Product")[:75] + "..."
+            
+            # <-- NEW: If the name exists, append a number to make it unique
+            if base_name in seen_names:
+                seen_names[base_name] += 1
+                final_name = f"{base_name} ({seen_names[base_name]})"
+            else:
+                seen_names[base_name] = 1
+                final_name = base_name
+                
             dynamic_products.append({
-                "name": item.get("title", "Unknown Product")[:80] + "...",
+                "name": final_name,
                 "price_usd": item.get("price", {}).get("value", 0.0),
                 "link": item.get("link", ""),
                 "raw_specs": item.get("rating", 0)
@@ -235,16 +246,30 @@ for product in surviving_products:
     results.append({
         "Product": product["name"],
         "Price": f"${product.get('price_usd', 0)}",
-        "Match Score": round(final_score, 1)
+        "Match Score": round(final_score, 1),
+        "Link": product.get("link", "")
     })
 
+# --- DATA FORMATTING & DISPLAY ---
 # --- DATA FORMATTING & DISPLAY ---
 df = pd.DataFrame(results).sort_values(by="Match Score", ascending=False).reset_index(drop=True)
 df.index = df.index + 1 
 
 if not df.empty:
     st.success(f"🏆 **Top Pick:** {df.iloc[0]['Product']} (Score: {df.iloc[0]['Match Score']})")
-    st.dataframe(df, use_container_width=True)
+    
+    # Configure the dataframe to render the URL as a clean, clickable hyperlink
+    st.dataframe(
+        df, 
+        column_config={
+            "Link": st.column_config.LinkColumn(
+                "Buy Link", 
+                help="Click to view this product on Amazon",
+                display_text="View Deal 🛒"
+            )
+        },
+        use_container_width=True
+    )
 
 # --- AI EXPLAINABILITY LAYER ---
 st.divider()
