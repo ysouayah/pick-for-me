@@ -14,6 +14,28 @@ st.set_page_config(page_title="Pick For Me", page_icon="⚖️", layout="centere
 api_key = st.secrets["GEMINI_API_KEY"]
 client = genai.Client(api_key=api_key)
 
+def clean_llm_json(raw_text):
+    """Strips markdown formatting so json.loads() doesn't crash."""
+    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(cleaned)
+
+def call_gemini_with_retry(prompt, config, max_retries=5): # Bumped to 5
+    """Tries to call Gemini, waiting and retrying if Google's servers are overloaded."""
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=config
+            )
+        except Exception as e:
+            if "503" in str(e) and attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"⚠️ Caught 503 error from Google. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            raise e
+
 # --- UI SKELETON ---
 st.title("⚖️ Pick For Me")
 st.subheader("The transparent decision engine.")
@@ -22,7 +44,18 @@ st.success("Environment and API configured successfully!")
 # --- LIVE MARKET SEARCH ---
 st.divider()
 st.header("🔍 Search Live Market")
-user_search = st.text_input("What are you shopping for?", value="Sneakers")
+
+# 1. Remove the default value and add a helpful placeholder
+user_search = st.text_input(
+    "What are you shopping for?", 
+    value="", 
+    placeholder="e.g., Laptops, Office Chairs, Running Shoes"
+)
+
+# 2. Halt the app from loading the rest of the UI or pinging APIs until a search is entered
+if not user_search.strip():
+    st.info("👋 Welcome to Pick For Me! Enter a product category above to get started.")
+    st.stop()
 
 # --- DYNAMIC FETCHER (RAINFOREST API) ---
 @st.cache_data(ttl=3600)
@@ -119,10 +152,10 @@ def filter_dealbreakers(product_list, budget, constraints_text):
             contents=filter_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        valid_ids = json.loads(response.text)
+        valid_ids = clean_llm_json(response.text) # <-- USING THE NEW CLEANER
         return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)]
     except Exception as e:
-        st.warning("AI Pre-filter failed, passing all budget-approved items through.")
+        st.warning(f"AI Pre-filter failed: {e}") 
         return budget_filtered
 
 with st.spinner("Screening products against your dealbreakers..."):
@@ -154,8 +187,9 @@ def generate_dropdown_options(category: str) -> list:
             contents=system_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
         )
-        return json.loads(response.text)
-    except Exception:
+        return clean_llm_json(response.text) # <-- USING THE NEW CLEANER
+    except Exception as e:
+        st.error(f"Criteria generation failed: {e}") # <-- EXPOSE THE ERROR
         return ["Price", "Performance", "Build Quality", "Reliability", "Design", "Value"]
 
 if "dropdown_options" not in st.session_state or st.session_state.get("last_search_dropdown") != user_search:
@@ -193,13 +227,13 @@ def generate_ai_scores(product_list, criteria_list):
     Return ONLY a flat JSON array of dictionaries. The array order MUST exactly match the product order.
     """
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=scoring_prompt,
+        response = call_gemini_with_retry(
+            prompt=scoring_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(response.text)
-    except Exception:
+        return clean_llm_json(response.text)
+    except Exception as e:
+        st.warning(f"Scoring failed: {e}") 
         return [{c: 5 for c in criteria_list} for _ in product_list]
 
 with st.spinner("AI is evaluating the surviving market against your criteria..."):
