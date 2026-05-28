@@ -1,0 +1,136 @@
+{
+    "Laptops": [
+      {
+        "id": "lap-1",
+        "name": "MacBook Air M3",
+        "price_usd": 1099,
+        "description": "Lightweight powerhouse with exceptional battery life.",
+        "scores": {
+          "Performance": 8,
+          "Battery Life": 10,
+          "Portability": 9,
+          "Build Quality": 9,
+          "Affordability": 6
+        }
+      },
+      {
+        "id": "lap-2",
+        "name": "Dell XPS 13",
+        "price_usd": 1299,
+        "description": "Premium Windows ultrabook with a stunning display.",
+        "scores": {
+          "Performance": 8,
+          "Battery Life": 7,
+          "Portability": 9,
+          "Build Quality": 8,
+          "Affordability": 5
+        }
+      },
+      {
+        "id": "lap-3",
+        "name": "Lenovo ThinkPad X1 Carbon",
+        "price_usd": 1499,
+        "description": "The gold standard for business laptops with a best-in-class keyboard.",
+        "scores": {
+          "Performance": 7,
+          "Battery Life": 8,
+          "Portability": 8,
+          "Build Quality": 10,
+          "Affordability": 4
+        }
+      },
+      {
+        "id": "lap-4",
+        "name": "ASUS ROG Zephyrus G14",
+        "price_usd": 1599,
+        "description": "Compact gaming laptop that balances power and portability.",
+        "scores": {
+          "Performance": 10,
+          "Battery Life": 6,
+          "Portability": 7,
+          "Build Quality": 8,
+          "Affordability": 3
+        }
+      },
+      {
+        "id": "lap-5",
+        "name": "Acer Swift 3",
+        "price_usd": 650,
+        "description": "Budget-friendly option that covers all the basics reliably.",
+        "scores": {
+          "Performance": 5,
+          "Battery Life": 7,
+          "Portability": 8,
+          "Build Quality": 5,
+          "Affordability": 10
+        }
+      }
+    ],
+    "Tennis Shoes": [
+      {
+        "id": "shoe-1",
+        "name": "Nike Zoom Vapor Pro",
+        "price_usd": 120,
+        "description": "Lightweight and responsive, built for speed on hard courts.",
+        "scores": {
+          "Comfort": 7,
+          "Durability": 6,
+          "Traction": 9,
+          "Stability": 7,
+          "Affordability": 7
+        }
+      },
+      {
+        "id": "shoe-2",
+        "name": "ASICS Gel-Resolution 9",
+        "price_usd": 145,
+        "description": "Top-tier stability and durability for aggressive baseliners.",
+        "scores": {
+          "Comfort": 9,
+          "Durability": 10,
+          "Traction": 8,
+          "Stability": 10,
+          "Affordability": 5
+        }
+      },
+      {
+        "id": "shoe-3",
+        "name": "Adidas Barricade",
+        "price_usd": 150,
+        "description": "Iconic hard-court shoe known for its locked-in feel.",
+        "scores": {
+          "Comfort": 6,
+          "Durability": 9,
+          "Traction": 9,
+          "Stability": 9,
+          "Affordability": 4
+        }
+      },
+      {
+        "id": "shoe-4",
+        "name": "Babolat Jet Mach III",
+        "price_usd": 130,
+        "description": "Ultra-light design focusing on quick directional changes.",
+        "scores": {
+          "Comfort": 8,
+          "Durability": 5,
+          "Traction": 8,
+          "Stability": 6,
+          "Affordability": 6
+        }
+      },
+      {
+        "id": "shoe-5",
+        "name": "New Balance 696v5",
+        "price_usd": 65,
+        "description": "Excellent entry-level shoe for recreational play.",
+        "scores": {
+          "Comfort": 6,
+          "Durability": 5,
+          "Traction": 6,
+          "Stability": 5,
+          "Affordability": 10
+        }
+      }
+    ]
+  }
