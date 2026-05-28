@@ -27,7 +27,7 @@ MCDA math engines break when fed subjective or categorical data (e.g., "Must be 
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/ysouayah/pick-for-me.git](https://github.com/ysouayah/pick-for-me.git)
+   git clone https://github.com/ysouayah/pick-for-me.git
    cd pick-for-me
    ```
 
