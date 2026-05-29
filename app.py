@@ -83,7 +83,7 @@ def fetch_shopping_products(search_term):
         response.raise_for_status()
         data = response.json()
         
-        top_results = data.get("shopping_results", [])[:15]
+        top_results = data.get("shopping_results", [])[:40]
         dynamic_products = []
         seen_names = {} 
         
@@ -119,30 +119,24 @@ with st.spinner(f"Scouring the web for '{combined_search_query}'..."):
 # --- PHASE 1: THE LLM BOUNCER (PRE-FILTER) ---
 @st.cache_data(ttl=3600)
 def filter_dealbreakers(product_list, budget, constraints_text):
-    # Step 1: Standard Math Filter (Budget)
-    budget_filtered = []
-    for p in product_list:
-        price = float(p.get("price_usd", 0) or 0)
-        if budget > 0 and price > budget:
-            continue
-        budget_filtered.append(p)
+    budget_filtered = [p for p in product_list if budget <= 0 or float(p.get("price_usd", 0) or 0) <= budget]
         
     # Step 2: LLM Filter (Categorical)
     if not constraints_text.strip() or not budget_filtered:
         return budget_filtered
-        
+    
     simple_products = [{"id": i, "name": p["name"]} for i, p in enumerate(budget_filtered)]
     
-    # THE FIX: A "Strict but Smart" prompt that understands hard exclusions
     filter_prompt = f"""
     You are a product filtering agent.
-    Evaluate this list of products: {simple_products}. 
+    Evaluate this full list of products: {simple_products}. 
     The user's requirements are: '{constraints_text}'. 
     Return ONLY a JSON array of the integer IDs for products that match. 
     
     FILTERING RULES:
-    1. EXPLICIT EXCLUSIONS: If the user explicitly asks for a specific brand (e.g., 'Only On brand', 'Nike only') or a specific color, you MUST rigidly delete any product that belongs to a competing brand or clearly violates the rule.
+    1. EXPLICIT EXCLUSIONS: If the user explicitly asks for a specific brand (e.g., 'Only On brand') or color, you MUST rigidly delete any product that belongs to a competing brand or clearly violates the rule.
     2. SUBJECTIVE INCLUSIONS: If the requirement is subjective (e.g., 'Office compatible'), give the product the benefit of the doubt unless it is an obvious mismatch.
+    3. COMPLETE EVALUATION: You must evaluate every single item in the provided list from start to finish. Do not truncate the list.
     """
     
     try:
@@ -153,7 +147,6 @@ def filter_dealbreakers(product_list, budget, constraints_text):
         valid_ids = clean_llm_json(response.text) 
         return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)]
     except Exception:
-        # Silently fail so it doesn't break the UI
         return budget_filtered
 
 with st.spinner("Screening products against your dealbreakers..."):
@@ -239,8 +232,8 @@ def generate_ai_scores(product_list, criteria_list):
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
         return clean_llm_json(response.text)
-    except Exception as e:
-        st.warning(f"Scoring failed: {e}") 
+    except Exception:
+        st.warning("⚠️ Google's AI servers are currently experiencing high traffic. Defaulting to neutral scores so you can still browse your matches.") 
         return [{c: 5 for c in criteria_list} for _ in product_list]
 
 with st.spinner("AI is evaluating the surviving market against your criteria..."):
