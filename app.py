@@ -19,7 +19,7 @@ def clean_llm_json(raw_text):
     cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(cleaned)
 
-def call_gemini_with_retry(prompt, config, max_retries=5): # Bumped to 5
+def call_gemini_with_retry(prompt, config, max_retries=5): 
     """Tries to call Gemini, waiting and retrying if Google's servers are overloaded."""
     for attempt in range(max_retries):
         try:
@@ -38,56 +38,58 @@ def call_gemini_with_retry(prompt, config, max_retries=5): # Bumped to 5
 
 # --- UI SKELETON ---
 st.title("⚖️ Pick For Me")
-st.subheader("The transparent decision engine.")
 st.success("Environment and API configured successfully!")
 
-# --- LIVE MARKET SEARCH ---
+# --- LIVE MARKET SEARCH & CONSTRAINTS ---
 st.divider()
 st.header("🔍 Search Live Market")
 
-# 1. Remove the default value and add a helpful placeholder
 user_search = st.text_input(
     "What are you shopping for?", 
     value="", 
-    placeholder="e.g., Laptops, Office Chairs, Running Shoes"
+    placeholder="e.g., Laptops, Tennis Shoes, Sunscreen"
 )
 
-# 2. Halt the app from loading the rest of the UI or pinging APIs until a search is entered
 if not user_search.strip():
     st.info("👋 Welcome to Pick For Me! Enter a product category above to get started.")
     st.stop()
 
-# --- DYNAMIC FETCHER (RAINFOREST API) ---
+st.divider()
+st.header("1. Hard Constraints & Dealbreakers")
+st.write("Filter out options based on budget or specific requirements (e.g., 'Size 10', 'Must be white', 'On brand').")
+max_budget = st.number_input("Maximum Budget ($)", min_value=0.0, value=0.0, step=50.0, help="Set to 0 for no budget limit.")
+unstructured_constraints = st.text_area("Specific Requirements (Optional)", placeholder="e.g., Must be office compatible")
+
+# Combine the search term and constraints so Amazon fetches highly relevant items from the start
+combined_search_query = f"{user_search} {unstructured_constraints}".strip()
+
+# --- DYNAMIC FETCHER (GOOGLE SHOPPING VIA SERPAPI) ---
 @st.cache_data(ttl=3600)
-def fetch_amazon_products(search_term):
-    if "RAINFOREST_API_KEY" not in st.secrets:
-        st.error("Missing RAINFOREST_API_KEY in secrets.toml! Please add it.")
+def fetch_shopping_products(search_term):
+    if "SERPAPI_KEY" not in st.secrets:
+        st.error("Missing SERPAPI_KEY in secrets.toml! Please add it.")
         st.stop()
         
-    rainforest_key = st.secrets["RAINFOREST_API_KEY"]
-    
     params = {
-        "api_key": rainforest_key,
-        "type": "search",
-        "amazon_domain": "amazon.com",
-        "search_term": search_term,
-        "sort_by": "featured"
+        "engine": "google_shopping",
+        "q": search_term,
+        "api_key": st.secrets["SERPAPI_KEY"],
+        "hl": "en", # English
+        "gl": "us", # US Market
     }
 
     try:
-        response = requests.get("https://api.rainforestapi.com/request", params=params)
+        response = requests.get("https://serpapi.com/search", params=params)
         response.raise_for_status()
         data = response.json()
         
-        top_results = data.get("search_results", [])[:15]
-        
+        top_results = data.get("shopping_results", [])[:15]
         dynamic_products = []
-        seen_names = {} # <-- NEW: Dictionary to track duplicate names
+        seen_names = {} 
         
         for item in top_results:
+            # Google Shopping titles can be messy; this deduplicates identical strings
             base_name = item.get("title", "Unknown Product")[:75] + "..."
-            
-            # <-- NEW: If the name exists, append a number to make it unique
             if base_name in seen_names:
                 seen_names[base_name] += 1
                 final_name = f"{base_name} ({seen_names[base_name]})"
@@ -95,31 +97,26 @@ def fetch_amazon_products(search_term):
                 seen_names[base_name] = 1
                 final_name = base_name
                 
+            # SerpApi provides a cleanly formatted 'extracted_price' float
+            price = item.get("extracted_price", 0.0)
+                
             dynamic_products.append({
                 "name": final_name,
-                "price_usd": item.get("price", {}).get("value", 0.0),
-                "link": item.get("link", ""),
-                "raw_specs": item.get("rating", 0)
+                "price_usd": float(price),
+                # THE FIX: Tell it to look for Google's 'product_link' key first
+                "link": item.get("product_link", item.get("link", "")),
+                "seller": item.get("source", "Unknown") 
             })
-            
         return dynamic_products
-        
     except Exception as e:
-        st.error(f"Failed to fetch live Amazon data: {e}")
+        st.error(f"Failed to fetch live Google Shopping data: {e}")
         return []
 
-with st.spinner(f"Pulling live Amazon data for '{user_search}'..."):
-    raw_products = fetch_amazon_products(user_search)
+with st.spinner(f"Scouring the web for '{combined_search_query}'..."):
+    raw_products = fetch_shopping_products(combined_search_query)
 
 
 # --- PHASE 1: THE LLM BOUNCER (PRE-FILTER) ---
-st.divider()
-st.header("1. Hard Constraints & Dealbreakers")
-st.write("Filter out options based on budget or specific categorical requirements (e.g., 'Size 10', 'Nike brand only', 'Must be black').")
-
-max_budget = st.number_input("Maximum Budget ($)", min_value=0.0, value=0.0, step=50.0, help="Set to 0 for no budget limit.")
-unstructured_constraints = st.text_area("Specific Requirements (Optional)", placeholder="e.g., Must have a backlit keyboard and weigh under 3 lbs.")
-
 @st.cache_data(ttl=3600)
 def filter_dealbreakers(product_list, budget, constraints_text):
     # Step 1: Standard Math Filter (Budget)
@@ -136,26 +133,27 @@ def filter_dealbreakers(product_list, budget, constraints_text):
         
     simple_products = [{"id": i, "name": p["name"]} for i, p in enumerate(budget_filtered)]
     
+    # THE FIX: A "Strict but Smart" prompt that understands hard exclusions
     filter_prompt = f"""
-    You are a strict product screening agent.
-    The user has these mandatory dealbreakers: "{constraints_text}"
+    You are a product filtering agent.
+    Evaluate this list of products: {simple_products}. 
+    The user's requirements are: '{constraints_text}'. 
+    Return ONLY a JSON array of the integer IDs for products that match. 
     
-    Evaluate this list of products: {simple_products}
-    
-    Return ONLY a flat JSON array of the integer IDs for the products that likely meet the user's requirements based on their name. If a product clearly violates a requirement, exclude its ID.
-    Example output: [0, 2, 5, 6]
+    FILTERING RULES:
+    1. EXPLICIT EXCLUSIONS: If the user explicitly asks for a specific brand (e.g., 'Only On brand', 'Nike only') or a specific color, you MUST rigidly delete any product that belongs to a competing brand or clearly violates the rule.
+    2. SUBJECTIVE INCLUSIONS: If the requirement is subjective (e.g., 'Office compatible'), give the product the benefit of the doubt unless it is an obvious mismatch.
     """
     
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=filter_prompt,
+        response = call_gemini_with_retry(
+            prompt=filter_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        valid_ids = clean_llm_json(response.text) # <-- USING THE NEW CLEANER
+        valid_ids = clean_llm_json(response.text) 
         return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)]
-    except Exception as e:
-        st.warning(f"AI Pre-filter failed: {e}") 
+    except Exception:
+        # Silently fail so it doesn't break the UI
         return budget_filtered
 
 with st.spinner("Screening products against your dealbreakers..."):
@@ -165,32 +163,39 @@ if not surviving_products:
     st.warning("⚠️ No products matched your strict constraints. Try loosening your dealbreakers or raising your budget.")
     st.stop()
 
-
 # --- PHASE 2: STRICT QUANTITATIVE CRITERIA ---
 @st.cache_data(ttl=3600)
-def generate_dropdown_options(category: str) -> list:
+def generate_dropdown_options(category: str) -> dict:
     system_prompt = f"""
     You are a product analytics engine. 
-    Suggest a list of 10 to 12 distinct decision criteria a consumer should consider when shopping for: '{category}'.
+    Suggest 10 distinct, quantifiable decision criteria a consumer should consider when shopping for: '{category}'.
     
-    CRITICAL RULE: DO NOT suggest categorical, binary, or subjective preferences like 'Color', 'Size', 'Brand', or 'Style'. 
-    ONLY suggest quantifiable metrics that can logically be scored on a 1-10 scale (e.g., 'Durability', 'Battery Life', 'Weight', 'Refresh Rate').
+    CRITICAL RULE: DO NOT suggest categorical or binary preferences like 'Color' or 'Brand'. 
     
     RULES:
-    1. Output ONLY a valid, flat JSON array of strings.
-    2. Limit each criterion to 1-2 words max.
-    3. Always include "Price" or "Affordability" as an option.
+    1. Output ONLY a valid JSON dictionary.
+    2. The key must be the criterion name (1-2 words).
+    3. The value must be a concise, 1-sentence definition of that criterion.
+    4. Always include "Price" as a key.
+    
+    EXPECTED FORMAT:
+    {{"Price": "The overall financial cost.", "Traction": "The level of grip provided on various surfaces."}}
     """
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=system_prompt,
+        response = call_gemini_with_retry(
+            prompt=system_prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
         )
-        return clean_llm_json(response.text) # <-- USING THE NEW CLEANER
+        return clean_llm_json(response.text)
     except Exception as e:
-        st.error(f"Criteria generation failed: {e}") # <-- EXPOSE THE ERROR
-        return ["Price", "Performance", "Build Quality", "Reliability", "Design", "Value"]
+        st.error(f"Criteria generation failed: {e}")
+        # Fallback dictionary
+        return {
+            "Price": "The overall financial cost.", 
+            "Performance": "How well the product executes its primary function.", 
+            "Durability": "The expected lifespan and resistance to wear.", 
+            "Design": "The aesthetic and structural build quality."
+        }
 
 if "dropdown_options" not in st.session_state or st.session_state.get("last_search_dropdown") != user_search:
     st.session_state.dropdown_options = generate_dropdown_options(user_search)
@@ -198,18 +203,20 @@ if "dropdown_options" not in st.session_state or st.session_state.get("last_sear
 
 st.divider()
 st.header("2. Define Your Criteria")
-st.write(f"Select the quantifiable factors that matter most for scoring.")
+st.write(f"Select the quantifiable factors that matter most for scoring. Hover over the question marks for definitions.")
+
+# Extract just the keys (the criteria names) for the multiselect dropdown
+criteria_names = list(st.session_state.dropdown_options.keys())
 
 selected_criteria = st.multiselect(
     "Choose your criteria:",
-    options=st.session_state.dropdown_options,
-    default=st.session_state.dropdown_options[:4] if len(st.session_state.dropdown_options) >= 4 else st.session_state.dropdown_options
+    options=criteria_names,
+    default=criteria_names[:4] if len(criteria_names) >= 4 else criteria_names
 )
 
 if not selected_criteria:
     st.warning("Please select at least one criterion to continue.")
     st.stop()
-
 
 # --- PHASE 3: THE LLM SCORER ---
 @st.cache_data(ttl=3600)
@@ -251,7 +258,9 @@ st.write("Rate how important each factor is to you from 1 (Not Important) to 10 
 
 weights = {}
 for crit in selected_criteria:
-    weights[crit] = st.slider(crit, min_value=1, max_value=10, value=5)
+    definition = st.session_state.dropdown_options.get(crit, "Score from 1-10.")
+    weights[crit] = st.slider(crit, min_value=1, max_value=10, value=5, help=definition)
+
 
 # --- THE SCORING ENGINE ---
 st.divider()
@@ -285,7 +294,6 @@ for product in surviving_products:
     })
 
 # --- DATA FORMATTING & DISPLAY ---
-# --- DATA FORMATTING & DISPLAY ---
 df = pd.DataFrame(results).sort_values(by="Match Score", ascending=False).reset_index(drop=True)
 df.index = df.index + 1 
 
@@ -298,8 +306,8 @@ if not df.empty:
         column_config={
             "Link": st.column_config.LinkColumn(
                 "Buy Link", 
-                help="Click to view this product on Amazon",
-                display_text="View Deal 🛒"
+                help="Click to view this product on Google Shopping",
+                display_text="View Product"
             )
         },
         use_container_width=True
@@ -327,7 +335,7 @@ if st.button("Explain My Top Match") and not df.empty:
                 contents=explanation_prompt,
             )
             st.info(f"💡 **Why it won:** {explanation_response.text.strip()}")
-        except Exception as e:
+        except Exception:
             st.warning("💡 **Why it won:** This product scored the highest aggregate match across your weighted priorities.")
 
 # --- VISUALIZATION: EXPLAINABILITY CHART ---
