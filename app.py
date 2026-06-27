@@ -167,20 +167,36 @@ def filter_dealbreakers(product_list, budget, constraints_text):
     simple_products = [{"id": i, "name": p["name"]} for i, p in enumerate(budget_filtered)]
     
     filter_prompt = f"""
-    Evaluate this list: {simple_products}. 
-    User requirements: '{constraints_text}'. 
-    Return ONLY a JSON array of the integer IDs for items that match. 
-    1. EXPLICIT EXCLUSIONS: Rigidly delete clear violations of brand, color, or hard features.
-    2. Complete evaluation. Do not truncate.
+    You are a product filtering agent.
+    Evaluate this list of items: {simple_products}. 
+    The user's strict dealbreakers are: '{constraints_text}'. 
+    Return ONLY a JSON array of the integer IDs for items that pass this initial screening. 
+    
+    FILTERING RULES:
+    1. OBVIOUS CONTRADICTIONS: Delete any item that directly violates a clear constraint (e.g., straight cable when right-angle is required).
+    2. THE CABLE & VIDEO PROTOCOL RULE: If the user explicitly requires video display, monitor, or 4K support, you MUST eliminate items whose titles indicate they are purely for mobile phones or basic charging (e.g., 'iPhone Charger', 'Fast Charging Cable', 'Power Cord', 'Charging Cable'). You may ONLY let a cable pass if its title explicitly includes video/high-bandwidth indicators like 'Display', 'Video', '4K', '8K', 'Monitor', 'DisplayPort', 'Alt Mode', '10Gbps', '20Gbps', or '40Gbps'. Pure charging cables cannot drive monitors.
+    3. COMPLETE EVALUATION: Evaluate every single item in the provided list. Do not truncate.
     """
     try:
         response = call_gemini_with_retry(
             prompt=filter_prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
         )
-        valid_ids = clean_llm_json(response.text) 
+        valid_ids = json.loads(response.text)
+        
+        # --- THE FAIL-SAFE ---
+        # If the bouncer kills everything because of bad retail titles, bypass it.
+        if not valid_ids:
+            st.warning("⚠️ Phase 1 Bouncer was too strict (titles lacked specs). Bypassing to Phase 3.")
+            return budget_filtered
+            
         return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)]
-    except Exception:
+        
+    except Exception as e:
+        print(f"❌ Filter Error: {e}")
         return budget_filtered
 
 with st.spinner("Screening options against your dealbreakers..."):
