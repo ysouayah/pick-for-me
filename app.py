@@ -7,6 +7,8 @@ import time
 import plotly.express as px
 import requests
 from pydantic import BaseModel
+from urllib.parse import quote_plus
+import concurrent.futures
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Pick For Me", page_icon="⚖️", layout="centered")
@@ -16,12 +18,10 @@ api_key = st.secrets["GEMINI_API_KEY"]
 client = genai.Client(api_key=api_key)
 
 def clean_llm_json(raw_text):
-    """Strips markdown formatting so json.loads() doesn't crash."""
     cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(cleaned)
 
 def call_gemini_with_retry(prompt, config, max_retries=5): 
-    """Tries to call Gemini, waiting and retrying if Google's servers are overloaded."""
     for attempt in range(max_retries):
         try:
             return client.models.generate_content(
@@ -53,7 +53,7 @@ if not user_search.strip():
     st.info("👋 Welcome to Pick For Me! Enter a product or venue category above to get started.")
     st.stop()
 
-# --- BUG FIX 2 & 4: INTENT ROUTER ---
+# --- INTENT ROUTER ---
 @st.cache_data(ttl=3600)
 def classify_search_intent(search_term):
     prompt = f"""
@@ -70,12 +70,15 @@ def classify_search_intent(search_term):
         )
         return clean_llm_json(response.text)
     except Exception:
+        # Smarter fallback if the API glitches
+        if any(word in search_term.lower() for word in ["restaurant", "cafe", "food", "dinner", "bar"]):
+            return {"domain": "local_business", "is_apparel": False}
         return {"domain": "retail", "is_apparel": False}
 
 with st.spinner("Analyzing intent..."):
     intent = classify_search_intent(user_search)
 
-# --- BUG FIX 4: DEMOGRAPHIC GATEKEEPER ---
+# --- DEMOGRAPHIC GATEKEEPER ---
 demographic_query = ""
 if intent.get("is_apparel"):
     st.warning("👕 **Apparel Detected:** Please specify sizing to filter out unpurchasable inventory.")
@@ -86,7 +89,7 @@ if intent.get("is_apparel"):
         sizes = st.multiselect("Acceptable Sizes:", ["6", "7", "8", "9", "10", "11", "12", "S", "M", "L", "XL"])
     
     if not gender or not sizes:
-        st.stop() # Halt execution until filled
+        st.stop() 
     demographic_query = f"{gender} size {','.join(sizes)}"
 
 st.divider()
@@ -94,9 +97,14 @@ st.header("1. Hard Constraints & Dealbreakers")
 max_budget = st.number_input("Maximum Budget ($)", min_value=0.0, value=0.0, step=50.0, help="Set to 0 for no budget limit.")
 unstructured_constraints = st.text_area("Specific Requirements (Optional)")
 
-combined_search_query = f"{user_search} {demographic_query} {unstructured_constraints}".strip()
+# --- THE SEARCH QUERY DECOUPLER ---
+if intent.get("domain") == "local_business":
+    api_search_query = user_search.strip()
+else:
+    api_search_query = f"{user_search} {demographic_query}".strip()
 
-# --- BUG FIX 2: DECOUPLED FETCHER ---
+# --- DECOUPLED FETCHER WITH PARALLEL PAGINATION & METADATA ---
+# NOTE: Caching removed so dead API calls do not permanently stick to the session
 @st.cache_data(ttl=3600)
 def fetch_dynamic_data(search_term, domain):
     if "SERPAPI_KEY" not in st.secrets:
@@ -104,78 +112,113 @@ def fetch_dynamic_data(search_term, domain):
         st.stop()
         
     engine = "google_local" if domain == "local_business" else "google_shopping"
-    params = {
-        "engine": engine,
-        "q": search_term,
-        "api_key": st.secrets["SERPAPI_KEY"],
-        "hl": "en",
-        "gl": "us",
-    }
+    
+    def fetch_page(start_offset):
+        params = {
+            "engine": engine,
+            "q": search_term,
+            "api_key": st.secrets["SERPAPI_KEY"],
+            "hl": "en",
+            "gl": "us",
+            "start": start_offset
+        }
+        try:
+            response = requests.get("https://serpapi.com/search", params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"⚠️ Page {start_offset} fetch failed: {e}")
+            return {}
 
-    try:
-        response = requests.get("https://serpapi.com/search", params=params)
-        response.raise_for_status()
-        data = response.json()
+    dynamic_items = []
+    seen_names = {}
+    raw_results = []
+    
+    offsets = [0, 40, 80] if domain == "retail" else [0, 20, 40]
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_offset = {executor.submit(fetch_page, offset): offset for offset in offsets}
+        for future in concurrent.futures.as_completed(future_to_offset):
+            data = future.result()
+            if domain == "local_business":
+                raw_results.extend(data.get("local_results", []))
+            else:
+                raw_results.extend(data.get("shopping_results", []))
+                
+    for item in raw_results:
+        base_name = item.get("title", "Unknown Product")[:75]
+        if base_name in seen_names:
+            continue
+        seen_names[base_name] = True
         
-        dynamic_items = []
-        seen_names = {} 
-        
-        # Route parser based on domain
         if domain == "local_business":
-            results = data.get("local_results", [])[:40]
-            for item in results:
-                base_name = item.get("title", "Unknown Venue")[:75]
-                final_name = f"{base_name} ({seen_names[base_name]})" if base_name in seen_names else base_name
-                seen_names[base_name] = seen_names.get(base_name, 0) + 1
-                
-                dynamic_items.append({
-                    "name": final_name,
-                    "price_usd": 0.0, 
-                    "price_str": item.get("price", "N/A"), # <-- ADD THIS LINE to grab the $$ string
-                    "link": item.get("website", item.get("links", {}).get("website", "")),
-                    "seller": item.get("address", "Unknown Address") 
-                })
+            dynamic_items.append({
+                "name": base_name,
+                "type": item.get("type", "Venue"), 
+                "price_usd": 0.0, 
+                "price_str": item.get("price", "N/A"), 
+                "primary_link": item.get("website", item.get("links", {}).get("website", "")),
+                "fallback_link": "",
+                "seller": item.get("address", "Unknown Address") 
+            })
         else:
-            results = data.get("shopping_results", [])[:40]
-            for item in results:
-                base_name = item.get("title", "Unknown Product")[:75]
-                final_name = f"{base_name} ({seen_names[base_name]})" if base_name in seen_names else base_name
-                seen_names[base_name] = seen_names.get(base_name, 0) + 1
-                
-                dynamic_items.append({
-                    "name": final_name,
-                    "price_usd": float(item.get("extracted_price", 0.0)),
-                    "link": item.get("product_link", item.get("link", "")),
-                    "seller": item.get("source", "Unknown") 
-                })
-        return dynamic_items
-    except Exception as e:
-        st.error(f"Failed to fetch live data: {e}")
-        return []
+            seller_name = item.get("source", "Unknown")
+            original_link = item.get("product_link", item.get("link", ""))
+            
+            if "amazon" in seller_name.lower() or "amazon.com" in original_link.lower():
+                primary_link = original_link
+                fallback_link = ""
+            else:
+                encoded_title = quote_plus(base_name)
+                primary_link = f"https://www.amazon.com/s?k={encoded_title}"
+                fallback_link = original_link
+            
+            dynamic_items.append({
+                "name": base_name,
+                "type": "Product",
+                "price_usd": float(item.get("extracted_price", 0.0)),
+                "primary_link": primary_link,
+                "fallback_link": fallback_link,
+                "seller": seller_name
+            })
+            
+    return dynamic_items
 
-with st.spinner(f"Scouring the web for '{combined_search_query}'..."):
-    raw_products = fetch_dynamic_data(combined_search_query, intent.get("domain"))
+with st.spinner(f"Scouring the web for '{api_search_query}'..."):
+    raw_products = fetch_dynamic_data(api_search_query, intent.get("domain"))
+
+# New Check: Make sure Google actually returned data before moving to Phase 1
+if not raw_products:
+    st.error("⚠️ The web scraper found 0 results. Google might have blocked the request or timed out. Try clearing your cache.")
+    st.stop()
 
 # --- PHASE 1: THE LLM BOUNCER ---
 @st.cache_data(ttl=3600)
-def filter_dealbreakers(product_list, budget, constraints_text):
+def filter_dealbreakers(product_list, budget, constraints_text, core_query):
     budget_filtered = [p for p in product_list if budget <= 0 or float(p.get("price_usd", 0) or 0) <= budget]
         
-    if not constraints_text.strip() or not budget_filtered:
-        return budget_filtered
+    if not budget_filtered:
+        return []
     
-    simple_products = [{"id": i, "name": p["name"]} for i, p in enumerate(budget_filtered)]
+    # FIX: If the user didn't enter constraints, skip the AI entirely and push data to Phase 3
+    if not constraints_text.strip():
+        return budget_filtered[:40]
+    
+    simple_products = [{"id": i, "name": p["name"], "category_type": p.get("type", "N/A")} for i, p in enumerate(budget_filtered)]
     
     filter_prompt = f"""
-    You are a product filtering agent.
-    Evaluate this list of items: {simple_products}. 
+    You are a strict data filtering agent.
+    Evaluate this list of options: {simple_products}. 
+    The user's original core search query is: '{core_query}'.
     The user's strict dealbreakers are: '{constraints_text}'. 
     Return ONLY a JSON array of the integer IDs for items that pass this initial screening. 
     
     FILTERING RULES:
-    1. OBVIOUS CONTRADICTIONS: Delete any item that directly violates a clear constraint (e.g., straight cable when right-angle is required).
-    2. THE CABLE & VIDEO PROTOCOL RULE: If the user explicitly requires video display, monitor, or 4K support, you MUST eliminate items whose titles indicate they are purely for mobile phones or basic charging (e.g., 'iPhone Charger', 'Fast Charging Cable', 'Power Cord', 'Charging Cable'). You may ONLY let a cable pass if its title explicitly includes video/high-bandwidth indicators like 'Display', 'Video', '4K', '8K', 'Monitor', 'DisplayPort', 'Alt Mode', '10Gbps', '20Gbps', or '40Gbps'. Pure charging cables cannot drive monitors.
-    3. COMPLETE EVALUATION: Evaluate every single item in the provided list. Do not truncate.
+    1. CATEGORY & CUISINE ALIGNMENT (LOCAL BUSINESS): If the core search or constraints specify a distinct type of cuisine, establishment, or service, you MUST immediately eliminate any option whose 'category_type' or name explicitly contradicts it. 
+    2. OBVIOUS CONTRADICTIONS: Delete any item that directly violates a clear constraint.
+    3. BENEFIT OF THE DOUBT (RETAIL ONLY): Do NOT delete a retail item just because a requested spec is missing from the title. If you aren't 100% sure it violates the rule, let it pass to Phase 3.
+    4. THE CABLE & VIDEO RULE: If video/display is required, eliminate pure charging cables.
+    5. COMPLETE EVALUATION: Evaluate every single item in the provided list. Do not truncate.
     """
     try:
         response = call_gemini_with_retry(
@@ -187,32 +230,30 @@ def filter_dealbreakers(product_list, budget, constraints_text):
         )
         valid_ids = json.loads(response.text)
         
-        # --- THE FAIL-SAFE ---
-        # If the bouncer kills everything because of bad retail titles, bypass it.
         if not valid_ids:
             st.warning("⚠️ Phase 1 Bouncer was too strict (titles lacked specs). Bypassing to Phase 3.")
-            return budget_filtered
+            return budget_filtered[:40]
             
-        return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)]
+        return [budget_filtered[i] for i in valid_ids if i < len(budget_filtered)][:40]
         
     except Exception as e:
         print(f"❌ Filter Error: {e}")
-        return budget_filtered
+        return budget_filtered[:40]
 
 with st.spinner("Screening options against your dealbreakers..."):
-    surviving_products = filter_dealbreakers(raw_products, max_budget, unstructured_constraints)
+    surviving_products = filter_dealbreakers(raw_products, max_budget, unstructured_constraints, user_search)
 
 if not surviving_products:
     st.warning("⚠️ No options matched your strict constraints.")
     st.stop()
 
-# --- PHASE 2: STRICT QUANTITATIVE CRITERIA ---
+# --- PHASE 2: DYNAMIC AI CRITERIA ---
 @st.cache_data(ttl=3600)
 def generate_dropdown_options(category: str, domain: str) -> dict:
     system_prompt = f"""
     You are an analytics engine. 
     Suggest 10 distinct, quantifiable decision criteria a user should consider when evaluating a '{category}'.
-    Context: This is a '{domain}' (e.g. if local_business, criteria like 'Ambiance', 'Location', 'Capacity').
+    Context: This is a '{domain}'.
     
     CRITICAL: Output ONLY a valid JSON dictionary. Key = Criterion (1-2 words). Value = 1 sentence definition.
     """
@@ -252,11 +293,31 @@ class ProductEvaluation(BaseModel):
 
 # --- PHASE 3: THE LLM SCORER ---
 @st.cache_data(ttl=3600)
+# --- PHASE 3: THE LLM SCORER ---
+@st.cache_data(ttl=3600)
 def generate_ai_scores(product_list, criteria_list):
-    simple_products = [{"name": p["name"]} for p in product_list]
+    # FIX: We are finally passing the actual live scraped prices to the AI Scorer
+    simple_products = [
+        {
+            "name": p["name"], 
+            "price": p.get("price_str") if p.get("price_str") != "N/A" else f"${p.get('price_usd', 0)}"
+        } 
+        for p in product_list
+    ]
+    
     scoring_prompt = f"""
     Evaluate these options: {simple_products} against these criteria: {criteria_list}.
-    Rate each on a scale of 1 to 10 based on market knowledge. 
+    Rate each on a scale of 1 to 10 based on market knowledge and the provided price data. 
+    
+    CRITICAL SCORING RULES:
+    1. THE POLARITY RULE: A score of 10 must ALWAYS represent the most positive/desirable outcome for the consumer. 
+       - For 'Price'/Cost: 10 = Extremely cheap/Amazing value. 1 = Outrageously expensive.
+       - For 'Quality', 'Durability', etc.: 10 = World-class. 1 = Terrible.
+       
+    2. THE DROPSHIPPER PENALTY (BRAND REALITY CHECK): You are evaluating live web-scraped retail data. You MUST aggressively penalize unbranded, keyword-stuffed products. 
+       - If a product title is a salad of generic buzzwords (e.g., "Best Ergonomic 3D Adjustable...") and lacks a reputable premium brand name, you must assume it is cheap, low-quality white-label garbage. Score it extremely low (1 to 3) for criteria like Durability, Quality, Comfort, or Adjustability.
+       - Conversely, heavily reward verified premium brands (e.g., Steelcase, Herman Miller, Haworth, Humanscale) for those same criteria, even if their title is short.
+    
     You must return a list of evaluations matching the EXACT order of the provided products.
     """
     try:
@@ -264,16 +325,12 @@ def generate_ai_scores(product_list, criteria_list):
             prompt=scoring_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", 
-                response_schema=list[ProductEvaluation], # The API-safe schema
+                response_schema=list[ProductEvaluation], 
                 temperature=0.1
             )
         )
         
-        # Pydantic schema returns {"scores": [{"criterion": "Price", "score": 8}]}
-        # We parse it into Python objects
         raw_evaluations = json.loads(response.text) 
-        
-        # Convert it back to the flat {"Price": 8} dictionary the rest of the app expects
         formatted_scores = []
         for eval_obj in raw_evaluations:
             flat_dict = {item["criterion"]: item["score"] for item in eval_obj.get("scores", [])}
@@ -304,14 +361,20 @@ for crit in selected_criteria:
 st.divider()
 st.header("4. Your Recommendations")
 
-total_weight = sum(weights.values())
+display_limit = st.slider("Number of Results to Show", min_value=1, max_value=40, value=10)
+
+# AMPLIFY WEIGHTS: Convert linear 0-10 UI scale to an exponential internal scale for visual separation
+internal_weights = {crit: (val ** 2) for crit, val in weights.items()}
+total_weight = sum(internal_weights.values())
+
 results = []
 breakdown_data = [] 
 
 for product in surviving_products:
     final_score = 0
-    for crit, weight in weights.items():
-        normalized_weight = weight / total_weight if total_weight > 0 else 0
+    # FIX: Loop through the amplified internal_weights
+    for crit, internal_weight in internal_weights.items():
+        normalized_weight = internal_weight / total_weight if total_weight > 0 else 0
         product_crit_score = product.get("scores", {}).get(crit, 5) 
         
         weighted_contribution = (normalized_weight * product_crit_score) * 10
@@ -323,34 +386,54 @@ for product in surviving_products:
             "Points Contributed": weighted_contribution
         })
         
+    is_local = intent.get("domain") == "local_business"
+    primary_label = "Website" if is_local else "Find on Amazon"
+    fallback_label = "Address" if is_local else "Alternative Link"
+    
+    if is_local:
+        raw_url = product.get("primary_link", "")
+        primary_val = raw_url if raw_url else f"https://www.google.com/search?q={quote_plus(product['name'])}"
+        fallback_val = product.get("seller", "N/A")
+    else:
+        primary_val = product.get("primary_link", "")
+        fallback_val = product.get("fallback_link") if product.get("fallback_link") else None
+    
     results.append({
         "Option": product["name"],
-        "Price": product.get("price_str", "N/A") if intent.get("domain") == "local_business" else (f"${product.get('price_usd', 0)}" if product.get('price_usd', 0) > 0 else "N/A"),
+        "Price": product.get("price_str", "N/A") if is_local else (f"${product.get('price_usd', 0)}" if product.get('price_usd', 0) > 0 else "N/A"),
         "Match Score": round(final_score, 1),
-        "Link": product.get("link", "")
+        primary_label: primary_val,
+        fallback_label: fallback_val
     })
 
-# --- BUG FIX 1: REACTIVE SORTING ---
-# Forcing the dataframe to sort top-to-bottom every time a slider is moved
+# --- REACTIVE SORTING & LIMITING ---
 df = pd.DataFrame(results).sort_values(by="Match Score", ascending=False).reset_index(drop=True)
+df = df.head(display_limit)
 df.index = df.index + 1 
 
 if not df.empty:
     st.success(f"🏆 **Top Pick:** {df.iloc[0]['Option']} (Score: {df.iloc[0]['Match Score']})")
     
+    column_config = {}
+    if intent.get("domain") == "local_business":
+        column_config["Website"] = st.column_config.LinkColumn("Website", display_text="Visit")
+    else:
+        column_config["Find on Amazon"] = st.column_config.LinkColumn("Find on Amazon", display_text="Search Amazon")
+        column_config["Alternative Link"] = st.column_config.LinkColumn("Alternative Link", display_text="Direct Vendor")
+
     st.dataframe(
         df, 
-        column_config={"Link": st.column_config.LinkColumn("Link", display_text="View")},
+        column_config=column_config,
         use_container_width=True
     )
 
-# --- BUG FIX 3: AXIS CALIBRATION ---
+# --- AXIS CALIBRATION ---
 st.divider()
 st.subheader("📊 Score Breakdown")
 
 if not df.empty:
     df_breakdown = pd.DataFrame(breakdown_data)
-    # Sort the chart's categorical Y-axis to match the newly sorted DataFrame
+    df_breakdown = df_breakdown[df_breakdown['Option'].isin(df['Option'])]
     df_breakdown['Option'] = pd.Categorical(df_breakdown['Option'], categories=df['Option'][::-1], ordered=True)
 
     fig = px.bar(
@@ -359,18 +442,32 @@ if not df.empty:
         y="Option", 
         color="Criterion", 
         orientation="h",
-        height=500
+        # FIX 1: Increased vertical breathing room to 60px per row
+        height=max(500, len(df) * 60)
     )
-
-    # Calculate the dynamic floor (Lowest score in top 5, minus a visual buffer of 5)
-    min_top_score = df.head(5)['Match Score'].min()
-    axis_floor = max(0, min_top_score - 5)
 
     fig.update_layout(
         xaxis_title="Match Score",
         yaxis_title="",
-        margin=dict(l=0, r=0, t=0, b=0),
-        yaxis=dict(categoryorder='array', categoryarray=df['Option'].tolist()[::-1])
+        # FIX 2: Restored natural margins and cranked bottom margin for the legend
+        margin=dict(l=10, r=20, t=30, b=120),
+        # FIX 3: Moved legend to the bottom safely below the x-axis text
+        legend=dict(
+            orientation="h", 
+            yanchor="top", 
+            y=-0.2, 
+            xanchor="center", 
+            x=0.5,
+            title=""
+        ),
+        yaxis=dict(
+            categoryorder='array', 
+            categoryarray=df['Option'].tolist()[::-1],
+            # FIX 4: Truncate massive product names to 45 chars so bars can expand
+            tickmode='array',
+            ticktext=[name[:45] + '...' if len(name) > 45 else name for name in df['Option'].tolist()[::-1]],
+            tickvals=df['Option'].tolist()[::-1]
+        )
     )
 
     st.plotly_chart(fig, use_container_width=True)
